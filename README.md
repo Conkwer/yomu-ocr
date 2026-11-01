@@ -10,6 +10,11 @@ GUI is `src/gui.py` (the internal `refinedocr` naming will be renamed before
 the first public release). No prebuilt binaries or bundled OCR data are
 included yet.
 
+![yomu-ocr GUI](docs/screenshot.png)
+
+*Development build (internal name `refinedocr`): page marking, OCR regions,
+page preview and review tabs. The UI may still change.*
+
 ## Features
 
 - **Tesseract by default** — local, no server required, good for Russian and

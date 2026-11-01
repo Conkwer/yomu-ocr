@@ -32,6 +32,20 @@ included yet.
 DjVu is **not implemented yet**. The planned route is an external DjVuLibre
 install (`ddjvu`/`djvused`/`djvutxt`); no DjVu code or data is included here.
 
+## System requirements
+
+- **Windows 10 64-bit or newer** is the tested release target. Development
+  testing is done on **Windows 11 x64 LTSC 24H2**.
+- **Linux** source runs are supported: the core and GUI tests run headless on
+  Debian 12, and the dependencies (PySide6, PyMuPDF, Tesseract, Pandoc) are
+  available on Linux. No packaged Linux build is provided yet; a desktop
+  session with Qt/X11 or Wayland is needed for the GUI.
+- **macOS** is untested but should work from source in principle.
+- **64-bit only.** 32-bit Windows and 32-bit Python are not supported
+  (PySide6 has no 32-bit wheels).
+- Windows 7 x64 with VxKex is **not tested and not supported**. It might work
+  in theory, but this is unverified; 32-bit Windows 7 cannot work.
+
 ## Requirements
 
 - 64-bit Python 3.10+
@@ -62,7 +76,7 @@ pip install -r src\requirements-gui.txt
 python src\gui.py
 ```
 
-On Linux/macOS:
+On Linux (source run; tested headless on Debian 12) or macOS (untested):
 
 ```sh
 python3 -m venv .venv
@@ -159,6 +173,9 @@ yomu-ocr\
 The optional llama-server `.bat` from above belongs in `yomu-ocr\`; the
 relative paths in it then match this layout. For a frozen build, put
 `llama\`, `tesseract\`, the model files and the INI next to the executable.
+
+On Linux/macOS use the native binaries (`tesseract/tesseract`, no `.exe`) and
+`tesseract/tessdata`; the app looks for both names.
 
 ## Settings and portability
 

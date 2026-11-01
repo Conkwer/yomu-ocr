@@ -42,6 +42,14 @@ install (`ddjvu`/`djvused`/`djvutxt`); no DjVu code or data is included here.
   Ask tab
 - Pandoc is provided by `pypandoc_binary` for ODT/DOCX/HTML export
 
+## Tested with
+
+- **Tesseract 5.3** with `rus+eng` traineddata (the default local engine).
+- **`GLM-OCR.Q4_K_M.gguf`** with **`GLM-OCR.mmproj-Q8_0.gguf`** on
+  `llama-server` (the optional server engine and Ask tab).
+
+These models and traineddata are not included in this repository.
+
 ## Install from source
 
 ```bat
@@ -83,6 +91,30 @@ Server engine (requires `llama-server`):
 python src\refinedocr.py book.pdf --engine glm ^
   --server http://127.0.0.1:8090 --prompt "OCR markdown" -o book.md
 ```
+
+### Example `llama-server` launcher (Windows)
+
+```bat
+@echo off
+cd /d "%~dp0"
+
+.\llama\llama-server.exe ^
+  -m ".\GLM-OCR.Q4_K_M.gguf" ^
+  --mmproj ".\GLM-OCR.mmproj-Q8_0.gguf" ^
+  -c 8192 ^
+  -ngl 0 ^
+  -t 7 ^
+  --flash-attn off ^
+  --temp 0.05 ^
+  --port 8090
+
+pause
+```
+
+These flags are only a starting point: adjust `-t`, `-ngl`, context size, port
+and other options for your hardware and model. See the
+[llama-server documentation](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
+for details.
 
 See `--help` for all options.
 

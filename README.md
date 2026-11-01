@@ -238,5 +238,3 @@ Third-party components:
 
 No models, tessdata, samples or proprietary documents are bundled. Verify the
 license of any OCR data or documents you redistribute.
-
-This is an independent project; it is not affiliated with ABBYY FineReader.

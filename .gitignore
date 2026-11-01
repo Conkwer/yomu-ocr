@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.spec
+refinedocr.ini
+tessdata/
+tesseract/
+samples/dendy_112_games.pdf

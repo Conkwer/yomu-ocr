@@ -61,11 +61,17 @@ install (`ddjvu`/`djvused`/`djvutxt`); no DjVu code or data is included here.
 - **Tesseract 5.5.3 or newer** with `rus+eng` traineddata (the default local
   engine) — [Tesseract releases](https://github.com/tesseract-ocr/tesseract/releases/tag/5.5.3).
 - **`llama-server` from llama.cpp v0.8.0 or newer** with
-  **`GLM-OCR.Q4_K_M.gguf`** and **`GLM-OCR.mmproj-Q8_0.gguf`** — the optional
-  server engine and Ask tab. On Windows 11 64-bit with an AMD GPU, use the
-  **Windows x64 (Vulkan)** asset from the
+  **`GLM-OCR.Q4_K_M.gguf`** and **`GLM-OCR.mmproj-Q8_0.gguf`** from
+  [mradermacher/GLM-OCR-GGUF](https://huggingface.co/mradermacher/GLM-OCR-GGUF)
+  — the optional server engine and Ask tab. On Windows 11 64-bit with an AMD
+  GPU, use the **Windows x64 (Vulkan)** asset from the
   [llama.cpp v0.8.0 release](https://github.com/ggml-org/llama.cpp/releases/tag/v0.8.0).
 - These models and traineddata are not included in this repository.
+
+Other multimodal models (for example Gemma and Qwen) can in theory be used
+through the same OpenAI-compatible server API, but they are **not tested**.
+Their prompts and response formats differ from GLM-OCR's `OCR markdown`; use
+the model's own OCR/vision prompt.
 
 ## Install from source
 

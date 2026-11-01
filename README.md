@@ -44,11 +44,14 @@ install (`ddjvu`/`djvused`/`djvutxt`); no DjVu code or data is included here.
 
 ## Tested with
 
-- **Tesseract 5.3** with `rus+eng` traineddata (the default local engine).
-- **`GLM-OCR.Q4_K_M.gguf`** with **`GLM-OCR.mmproj-Q8_0.gguf`** on
-  `llama-server` (the optional server engine and Ask tab).
-
-These models and traineddata are not included in this repository.
+- **Tesseract 5.5.3 or newer** with `rus+eng` traineddata (the default local
+  engine) — [Tesseract releases](https://github.com/tesseract-ocr/tesseract/releases/tag/5.5.3).
+- **`llama-server` from llama.cpp v0.8.0 or newer** with
+  **`GLM-OCR.Q4_K_M.gguf`** and **`GLM-OCR.mmproj-Q8_0.gguf`** — the optional
+  server engine and Ask tab. On Windows 11 64-bit with an AMD GPU, use the
+  **Windows x64 (Vulkan)** asset from the
+  [llama.cpp v0.8.0 release](https://github.com/ggml-org/llama.cpp/releases/tag/v0.8.0).
+- These models and traineddata are not included in this repository.
 
 ## Install from source
 
@@ -120,12 +123,42 @@ See `--help` for all options.
 
 ## Tesseract setup
 
-- Install Tesseract-OCR so `tesseract.exe` is on `PATH` or in Program Files, or
-  place a portable copy in `tesseract\` next to the source/exe.
-- Put `*.traineddata` files in a `tessdata\` folder next to the source/exe, or
-  set `TESSDATA_PREFIX`.
+- Install [Tesseract 5.5.3 or newer](https://github.com/tesseract-ocr/tesseract/releases/tag/5.5.3)
+  (UB Mannheim installer on Windows), so `tesseract.exe` is on `PATH` or in
+  Program Files. You can also keep a portable copy in `tesseract\` next to the
+  source/exe.
+- Download only the language data you need from the
+  [tessdata repository](https://github.com/tesseract-ocr/tessdata/tree/main),
+  for example `eng.traineddata` and `rus.traineddata` — there is no need to
+  download the whole repository or all language blobs.
+- Put the selected `*.traineddata` files in `tesseract\tessdata\` next to the
+  source/exe, or in a `tessdata\` folder, or set `TESSDATA_PREFIX`.
 - The GUI Language combo lists installed languages and offers `rus+eng` when
   both are available.
+
+## Example directory layout
+
+```text
+yomu-ocr\
+  src\
+    gui.py
+    refinedocr.py
+    requirements-gui.txt
+  llama\
+    llama-server.exe        (+ DLLs from the llama.cpp release)
+  tesseract\
+    tesseract.exe           (+ DLLs for a portable copy)
+    tessdata\
+      eng.traineddata
+      rus.traineddata       (only the languages you need)
+  GLM-OCR.Q4_K_M.gguf
+  GLM-OCR.mmproj-Q8_0.gguf
+  refinedocr.ini            (created by the GUI)
+```
+
+The optional llama-server `.bat` from above belongs in `yomu-ocr\`; the
+relative paths in it then match this layout. For a frozen build, put
+`llama\`, `tesseract\`, the model files and the INI next to the executable.
 
 ## Settings and portability
 

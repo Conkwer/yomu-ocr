@@ -105,6 +105,7 @@ class OcrSettings:
     output_dir: str = ""
     force_ocr: bool = False
     spreads: str = "off"
+    trim_enabled: bool = False
     engine: str = core.DEFAULT_ENGINE
     tesseract_lang: str = core.DEFAULT_TESSERACT_LANG
     tesseract_path: str = ""
@@ -117,11 +118,57 @@ class FileJob:
     status: str = "Pending"
     page_pngs: list = field(default_factory=list)
     page_texts: list[str] = field(default_factory=list)
+    page_keys: list[object] = field(default_factory=list)
+    page_sizes: list[tuple[float, float]] = field(default_factory=list)
     regions: dict[int, list[list[float]]] = field(default_factory=dict)
     splits: dict[int, float] = field(default_factory=dict)
+    no_split: set[int] = field(default_factory=set)
+    trim_cm: tuple[float, float, float, float] = core.DEFAULT_TRIM_CM
     selected_pages: set[int] = field(default_factory=set)
+    pages_to_ocr: set[int] = field(default_factory=set)
+    run_keys: dict[int, object] = field(default_factory=dict)
     output_path: str = ""
     error: str = ""
+
+
+def page_cache_key(settings: OcrSettings, job: FileJob, page_number: int):
+    """Exact input snapshot for one page's OCR result.
+
+    Any difference (engine parameters, DPI, split/regions/trim) means the
+    cached text is stale and the page is OCRed again on the next Start.
+    """
+    trim = None
+    if settings.trim_enabled and any(job.trim_cm):
+        trim = tuple(job.trim_cm)
+    if settings.engine == "tesseract":
+        engine = (
+            "tesseract",
+            settings.tesseract_lang,
+            settings.tesseract_path,
+        )
+    else:
+        engine = (
+            "glm",
+            settings.server,
+            settings.model,
+            settings.prompt,
+            settings.max_tokens,
+        )
+    return (
+        engine,
+        settings.dpi,
+        settings.max_side,
+        settings.force_ocr,
+        settings.spreads,
+        (
+            job.splits.get(page_number, 0.5)
+            if settings.spreads != "off"
+            else None
+        ),
+        page_number in job.no_split,
+        tuple(tuple(r) for r in job.regions.get(page_number, [])),
+        trim,
+    )
 
 
 class OCRWorker(QObject):
@@ -185,6 +232,9 @@ class OCRWorker(QObject):
                 job.status = "Skipped"
                 self.log.emit(f"{job.path.name}: no pages checked, skipped")
                 continue
+            if not job.pages_to_ocr:
+                # Every checked page already matches the cached result.
+                continue
             try:
                 self._process(index, job)
             except core.OCRCancelled:
@@ -215,18 +265,29 @@ class OCRWorker(QObject):
                 job.page_pngs = [None] * total
             if len(job.page_texts) != total:
                 job.page_texts = [""] * total
+            if len(job.page_keys) != total:
+                job.page_keys = [None] * total
             selected = sorted(
                 p for p in job.selected_pages if 1 <= p <= total
             )
             if not selected:
                 job.status = "Skipped"
                 return
-            for page_number in selected:
-                job.page_texts[page_number - 1] = ""
+            process_pages = sorted(
+                p for p in job.pages_to_ocr if 1 <= p <= total
+            )
+            if not process_pages:
+                # start_ocr() always fills pages_to_ocr before starting a
+                # worker. The fallback keeps direct _process() callers (tests)
+                # working; real all-cached jobs are skipped in run().
+                process_pages = selected
             self.file_pages.emit(index, total)
             is_pdf = job.path.suffix.lower() in core.PDF_SUFFIXES
+            trim = (
+                job.trim_cm if self.settings.trim_enabled else None
+            )
 
-            for page_number in selected:
+            for page_number in process_pages:
                 if self.stop.is_set():
                     raise core.OCRCancelled("cancelled by user")
                 page = document.load_page(page_number - 1)
@@ -245,9 +306,11 @@ class OCRWorker(QObject):
                 )
                 self.page_started.emit(index, page_number, total, preview)
 
+                page_trim = core.trim_rect(page, trim) if trim else None
                 regions = job.regions.get(page_number, [])
                 clips = []
                 if regions:
+                    # Explicit region selection wins; trim/split are ignored.
                     clips = [
                         self._clip_rect(page, region) for region in regions
                     ]
@@ -256,28 +319,39 @@ class OCRWorker(QObject):
                         f"({len(clips)} region(s))..."
                     )
                 else:
-                    spread = core.spread_clips(
+                    split = core.spread_clips(
                         page,
                         self.settings.spreads,
                         job.splits.get(page_number, 0.5),
+                        enabled=page_number not in job.no_split,
                     )
-                    if spread:
-                        clips = spread
+                    if split and page_trim is not None:
+                        split = core.trim_clips(split, page_trim)
+                    if split:
+                        clips = split
+                        halves = "2 halves" if len(split) == 2 else "1 half"
                         self.log.emit(
                             f"{job.path.name}: page {page_number} "
-                            f"spread {self.settings.spreads.upper()} "
-                            f"(2 halves)..."
+                            f"split {self.settings.spreads.upper()} "
+                            f"({halves})..."
                         )
                 if not clips:
-                    text = core.extract_text_layer(page) if is_pdf else ""
+                    text = (
+                        core.extract_text_layer(page, page_trim)
+                        if is_pdf
+                        else ""
+                    )
                     if text and not self.settings.force_ocr:
                         job.page_texts[page_number - 1] = text
+                        job.page_keys[page_number - 1] = job.run_keys.get(
+                            page_number
+                        )
                         self.log.emit(
                             f"{job.path.name}: page {page_number} text layer"
                         )
                         self.page_done.emit(index, page_number, text)
                         continue
-                    clips = [None]
+                    clips = [page_trim]
 
                 started = time.time()
                 pieces: list[str] = []
@@ -352,29 +426,25 @@ class OCRWorker(QObject):
                                 f"{job.path.name}: page {page_number} "
                                 f"{kind} {clip_index} returned no text"
                             )
-                            continue
-                        if not regions:
-                            raise RuntimeError(
-                                f"page {page_number}: model returned no text"
-                            )
-                        # A single selected region: fall through to the
-                        # shared "nothing recognized" error below.
+                        continue
                     pieces.append(result)
                     prompt_tokens += usage.get("prompt_tokens") or 0
                     completion_tokens += usage.get("completion_tokens") or 0
                     truncated = truncated or finish_reason == "length"
                 result = "\n\n".join(pieces)
                 if not result:
-                    if regions:
-                        detail = "selected regions"
-                    elif len(clips) > 1:
-                        detail = "page halves"
-                    else:
-                        detail = "page"
-                    raise RuntimeError(
-                        f"page {page_number}: nothing recognized in the "
-                        f"{detail}"
+                    # Blank/cover pages are normal; skip them instead of
+                    # failing the whole file. Cache the empty result so the
+                    # page is not OCRed again until Reset or a settings change.
+                    self.log.emit(
+                        f"{job.path.name}: page {page_number} no text "
+                        f"found, skipped"
                     )
+                    job.page_keys[page_number - 1] = job.run_keys.get(
+                        page_number
+                    )
+                    self.page_done.emit(index, page_number, "")
+                    continue
                 if truncated:
                     self.log.emit(
                         f"{job.path.name}: page {page_number} WARNING "
@@ -382,6 +452,9 @@ class OCRWorker(QObject):
                     )
                 elapsed = time.time() - started
                 job.page_texts[page_number - 1] = result
+                job.page_keys[page_number - 1] = job.run_keys.get(
+                    page_number
+                )
                 self.log.emit(
                     f"{job.path.name}: page {page_number} {len(result)} chars, "
                     f"{prompt_tokens}+{completion_tokens} tokens, "
@@ -396,7 +469,9 @@ class OCRWorker(QObject):
                 and job.page_texts[p - 1].strip()
             )
             if not markdown:
-                raise RuntimeError("nothing recognized")
+                raise RuntimeError(
+                    "nothing recognized on the checked pages"
+                )
             output_path = self._output_path(job)
             core.save_output(markdown, self.settings.out_format, output_path)
             job.status = "Done"
@@ -565,6 +640,8 @@ class ImageView(QWidget):
     message = Signal(str)
     zoom_requested = Signal(float)
     split_changed = Signal(float)
+    split_disabled = Signal()
+    trim_changed = Signal(tuple)
     pan_requested = Signal(int, int)
 
     _HANDLE_CURSORS = {
@@ -592,6 +669,11 @@ class ImageView(QWidget):
         self._spread = False
         self._auto_spread = False
         self._split = 0.5
+        self._split_disabled = False
+        self._trim_enabled = False
+        self._trim_cm = core.DEFAULT_TRIM_CM
+        self._page_size = (1.0, 1.0)
+        self._trim_edge = ""
         self._scale = 1.0
         self._autoscroll_active = False
         self._autoscroll_anchor_global = QPointF()
@@ -639,31 +721,123 @@ class ImageView(QWidget):
             self.unsetCursor()
 
     def set_spread(
-        self, enabled: bool, fraction: float = 0.5, auto: bool = False
+        self,
+        enabled: bool,
+        fraction: float = 0.5,
+        auto: bool = False,
+        disabled: bool = False,
     ) -> None:
-        """Show a movable split marker on landscape (or auto-wide) pages."""
+        """Show a movable split marker; auto limits it to wide pages."""
         self._spread = enabled
         self._auto_spread = auto
+        self._split_disabled = disabled
         self._split = min(max(fraction, 0.1), 0.9)
+        self.update()
+
+    def set_trim(self, enabled: bool, trim_cm, page_size_pt) -> None:
+        """Show Trim lines; ``page_size_pt`` is the display-space page size."""
+        valid = (
+            page_size_pt is not None
+            and page_size_pt[0] > 0
+            and page_size_pt[1] > 0
+        )
+        self._trim_enabled = bool(enabled) and valid
+        self._trim_cm = tuple(float(v) for v in trim_cm)
+        if valid:
+            self._page_size = (
+                float(page_size_pt[0]),
+                float(page_size_pt[1]),
+            )
         self.update()
 
     def _split_active(self) -> bool:
         if self._spread is False or self._source is None:
             return False
+        if self._split_disabled:
+            return False
         width, height = self._source.width(), self._source.height()
+        if not self._auto_spread:
+            # Explicit Books/Manga mode splits portrait two-column pages too.
+            return True
         if width <= height:
             return False
-        if self._auto_spread and width / height < core.AUTO_SPREAD_MIN_ASPECT:
+        if width / height < core.AUTO_SPREAD_MIN_ASPECT:
             return False
         return True
+
+    def _split_ghost(self) -> bool:
+        """Dim marker for a page where the explicit split is disabled."""
+        return (
+            self._spread
+            and self._split_disabled
+            and not self._auto_spread
+            and self._source is not None
+        )
+
+    def _split_visible(self) -> bool:
+        return self._split_active() or self._split_ghost()
 
     def _split_x(self) -> int:
         return int(round(self.width() * self._split))
 
     def _set_split_from_x(self, x: float) -> None:
         self._split = min(max(x / max(self.width(), 1), 0.1), 0.9)
-        self.split_changed.emit(self._split)
         self.update()
+
+    def _trim_px(self):
+        """Trim insets in widget pixels: (top, right, bottom, left)."""
+        top, right, bottom, left = self._trim_cm
+        width, height = float(self.width()), float(self.height())
+        page_w, page_h = self._page_size
+        px_per_cm_x = core.CM_TO_PT * width / page_w
+        px_per_cm_y = core.CM_TO_PT * height / page_h
+        t = min(max(top * px_per_cm_y, 0.0), height * 0.45)
+        b = min(max(bottom * px_per_cm_y, 0.0), height * 0.45)
+        l = min(max(left * px_per_cm_x, 0.0), width * 0.45)
+        r = min(max(right * px_per_cm_x, 0.0), width * 0.45)
+        return t, r, b, l
+
+    def _trim_hit(self, pos) -> str:
+        if not self._trim_enabled or self._source is None:
+            return ""
+        t, r, b, l = self._trim_px()
+        width, height = self.width(), self.height()
+        edges = (
+            ("top", abs(pos.y() - t)),
+            ("bottom", abs(pos.y() - (height - b))),
+            ("left", abs(pos.x() - l)),
+            ("right", abs(pos.x() - (width - r))),
+        )
+        edge, distance = min(edges, key=lambda item: item[1])
+        return edge if distance <= 6 else ""
+
+    def _set_trim_edge(self, edge: str, pos) -> None:
+        t, r, b, l = self._trim_px()
+        width, height = float(self.width()), float(self.height())
+        min_px = 10.0
+        if edge == "top":
+            t = min(max(pos.y(), 0.0), height - b - min_px)
+        elif edge == "bottom":
+            b = min(max(height - pos.y(), 0.0), height - t - min_px)
+        elif edge == "left":
+            l = min(max(pos.x(), 0.0), width - r - min_px)
+        elif edge == "right":
+            r = min(max(width - pos.x(), 0.0), width - l - min_px)
+        page_w, page_h = self._page_size
+        px_per_cm_x = core.CM_TO_PT * width / page_w
+        px_per_cm_y = core.CM_TO_PT * height / page_h
+        self._trim_cm = (
+            max(0.0, t / px_per_cm_y),
+            max(0.0, r / px_per_cm_x),
+            max(0.0, b / px_per_cm_y),
+            max(0.0, l / px_per_cm_x),
+        )
+        self.update()
+
+    def _trim_cursor(self, edge: str):
+        if edge in ("top", "bottom"):
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.SizeHorCursor
 
     def source_size(self):
         return self._source.size() if self._source is not None else None
@@ -776,9 +950,32 @@ class ImageView(QWidget):
                 source_rect.height() * scale,
             )
             painter.drawPixmap(target, self._source, source_rect)
+        if self._trim_enabled:
+            t, r, b, l = self._trim_px()
+            width, height = self.width(), self.height()
+            inner = QRectF(l, t, width - l - r, height - t - b)
+            if inner.width() > 2 and inner.height() > 2:
+                shade = QColor(0, 0, 0, 70)
+                painter.fillRect(QRectF(0, 0, width, t), shade)
+                painter.fillRect(QRectF(0, height - b, width, b), shade)
+                painter.fillRect(QRectF(0, t, l, height - t - b), shade)
+                painter.fillRect(
+                    QRectF(width - r, t, r, height - t - b), shade
+                )
+                painter.setPen(
+                    QPen(QColor("#00897b"), 1, Qt.PenStyle.DashLine)
+                )
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(inner)
         if self._split_active():
             painter.setPen(
                 QPen(QColor("#f57c00"), 2, Qt.PenStyle.DashLine)
+            )
+            split_x = self._split_x()
+            painter.drawLine(split_x, 0, split_x, self.height())
+        elif self._split_ghost():
+            painter.setPen(
+                QPen(QColor(150, 150, 150, 180), 1, Qt.PenStyle.DotLine)
             )
             split_x = self._split_x()
             painter.drawLine(split_x, 0, split_x, self.height())
@@ -890,6 +1087,11 @@ class ImageView(QWidget):
             return
         pos = event.position()
         if event.button() == Qt.MouseButton.RightButton:
+            if self._split_active() and abs(pos.x() - self._split_x()) <= 6:
+                self._split_disabled = True
+                self.split_disabled.emit()
+                self.update()
+                return
             index, _ = self._hit(pos)
             if index >= 0:
                 del self._regions[index]
@@ -903,11 +1105,21 @@ class ImageView(QWidget):
         ctrl = bool(
             event.modifiers() & Qt.KeyboardModifier.ControlModifier
         )
+        edge = self._trim_hit(pos)
+        if edge:
+            self._mode = "trim"
+            self._trim_edge = edge
+            self._selected = -1
+            self.update()
+            return
         if (
             not ctrl
-            and self._split_active()
+            and self._split_visible()
             and abs(pos.x() - self._split_x()) <= 6
         ):
+            if self._split_ghost():
+                # Dragging a dimmed marker re-enables the split.
+                self._split_disabled = False
             self._mode = "split"
             self._selected = -1
             self.update()
@@ -943,13 +1155,20 @@ class ImageView(QWidget):
         if not self._editable or self._source is None:
             return
         pos = event.position()
+        if self._mode == "trim":
+            self._set_trim_edge(self._trim_edge, pos)
+            return
         if self._mode == "split":
             self._set_split_from_x(pos.x())
             return
         if self._mode:
             self._drag_to(pos)
             return
-        if self._split_active() and abs(pos.x() - self._split_x()) <= 6:
+        edge = self._trim_hit(pos)
+        if edge:
+            self.setCursor(self._trim_cursor(edge))
+            return
+        if self._split_visible() and abs(pos.x() - self._split_x()) <= 6:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
             return
         index, part = self._hit(pos)
@@ -966,8 +1185,25 @@ class ImageView(QWidget):
         else:
             self.setCursor(self._HANDLE_CURSORS[part])
 
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 - Qt override
+        if self._source is None or not self._editable:
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._trim_hit(event.position()):
+            self._mode = ""
+            self._trim_edge = ""
+            self._trim_cm = tuple(core.DEFAULT_TRIM_CM)
+            self.update()
+            self.trim_changed.emit(tuple(self._trim_cm))
+
     def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override
         if not self._mode:
+            return
+        if self._mode == "trim":
+            self._mode = ""
+            self._trim_edge = ""
+            self.trim_changed.emit(tuple(self._trim_cm))
             return
         if self._mode == "split":
             self._mode = ""
@@ -1218,6 +1454,12 @@ class MainWindow(QMainWindow):
         self.render_timer = QTimer(self)
         self.render_timer.setInterval(500)
         self.render_timer.timeout.connect(self._refresh_rendered)
+        # Settings changes turn ✓ into ↻ (cached result is stale); debounce
+        # the marker refresh while the user types a prompt/server URL.
+        self.marks_timer = QTimer(self)
+        self.marks_timer.setSingleShot(True)
+        self.marks_timer.setInterval(250)
+        self.marks_timer.timeout.connect(self._refresh_page_marks)
 
     def _build_settings_panel(self) -> None:
         panel = QWidget()
@@ -1301,22 +1543,32 @@ class MainWindow(QMainWindow):
             "Enable this for tables/layout: the text layer loses "
             "row/column structure."
         )
+        self.trim_check = QCheckBox("Trim")
+        self.trim_check.setToolTip(
+            "Cut page margins before OCR and text-layer extraction, e.g. to "
+            "drop running heads and page numbers.\n"
+            "Drag the teal lines in the preview; double-click a line to "
+            "restore this file's defaults. Values are per file and apply to "
+            "every page; the default is 1 cm top and bottom."
+        )
         self.spreads_combo = QComboBox()
         for label, value in (
             ("Off", "off"),
-            ("Auto (LTR)", "auto"),
-            ("LTR (books)", "ltr"),
-            ("RTL (manga)", "rtl"),
+            ("Auto (L2R)", "auto"),
+            ("Books (L2R)", "ltr"),
+            ("Manga (R2L)", "rtl"),
         ):
             self.spreads_combo.addItem(label, value)
         self.spreads_combo.setToolTip(
-            "Split landscape two-page scans into left/right halves.\n"
+            "Split pages into left/right halves (two-page scans and "
+            "portrait two-column pages).\n"
             f"Auto: split pages at least "
-            f"{core.AUTO_SPREAD_MIN_ASPECT:g}x wider than tall, LTR order.\n"
-            "LTR: left page first (western books); RTL: right page first "
-            "(manga). Portrait pages are not split.\n"
-            "Drag the dashed line in the preview to adjust the split for the "
-            "current page. Pages with selected regions use the regions."
+            f"{core.AUTO_SPREAD_MIN_ASPECT:g}x wider than tall, L2R order.\n"
+            "Books: every page, left half first; Manga: every page, right "
+            "half first.\n"
+            "Drag the dashed line to adjust the split. Right-click the line "
+            "to disable the split for the current page (drag it again to "
+            "re-enable). Pages with selected regions use the regions."
         )
 
         # Row 1: server/OCR settings. Prompt lives in the Ask tab.
@@ -1335,8 +1587,9 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.tesseract_lang_combo)
         row1.addWidget(QLabel("Engine"))
         row1.addWidget(self.engine_combo)
-        row1.addWidget(QLabel("Spreads"))
+        row1.addWidget(QLabel("Split"))
         row1.addWidget(self.spreads_combo)
+        row1.addWidget(self.trim_check)
         row1.addWidget(self.force_check)
 
         # Row 2: output folder.
@@ -1352,6 +1605,20 @@ class MainWindow(QMainWindow):
         outer.addLayout(row1)
         outer.addLayout(row2)
         self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        # Any of these changes can make a cached page stale; refresh the
+        # ✓/↻ marks (debounced because prompt/server are text fields).
+        for signal in (
+            self.server_edit.textChanged,
+            self.dpi_spin.valueChanged,
+            self.max_side_spin.valueChanged,
+            self.tesseract_lang_combo.currentTextChanged,
+            self.engine_combo.currentIndexChanged,
+            self.spreads_combo.currentIndexChanged,
+            self.trim_check.toggled,
+            self.force_check.toggled,
+            self.prompt_edit.textChanged,
+        ):
+            signal.connect(self._schedule_marks_refresh)
         self.settings_panel = panel
 
     def _build_main_panel(self) -> None:
@@ -1368,25 +1635,33 @@ class MainWindow(QMainWindow):
         )
 
         pages_row = QHBoxLayout()
-        self.pages_label = QLabel("Pages")
-        self.pages_label.setToolTip(
-            "Checked pages are OCR'd and included in the output."
-        )
         self.btn_pages_all = QPushButton("All")
         self.btn_pages_none = QPushButton("None")
-        self.btn_pages_invert = QPushButton("Invert")
-        for button, mode in (
-            (self.btn_pages_all, "all"),
-            (self.btn_pages_none, "none"),
-            (self.btn_pages_invert, "invert"),
+        self.btn_pages_reset = QPushButton("Reset")
+        for button, mode, tip in (
+            (self.btn_pages_all, "all", "Check every page"),
+            (self.btn_pages_none, "none", "Uncheck every page"),
+            (
+                self.btn_pages_reset,
+                "reset",
+                "Forget recognized text of the checked pages (all pages "
+                "if none are checked); the next Start OCR re-recognizes "
+                "them. Does not touch trim.",
+            ),
         ):
             button.setMaximumWidth(56)
-            button.setToolTip("Check/uncheck pages")
+            button.setToolTip(tip)
             button.clicked.connect(
                 lambda checked=False, m=mode: self.select_pages(m)
             )
             pages_row.addWidget(button)
-        pages_row.addWidget(self.pages_label, 1)
+        pages_row.addStretch(1)
+        self.pages_label = QLabel("0/0")
+        self.pages_label.setToolTip(
+            "Checked pages / total. ✓ means already recognized "
+            "(cached results are reused unless Reset or settings change)."
+        )
+        pages_row.addWidget(self.pages_label)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -1402,6 +1677,8 @@ class MainWindow(QMainWindow):
         self.image_view.zoom_requested.connect(self._zoom_preview)
         self.image_view.pan_requested.connect(self._pan_preview)
         self.image_view.split_changed.connect(self.on_split_changed)
+        self.image_view.split_disabled.connect(self.on_split_disabled)
+        self.image_view.trim_changed.connect(self.on_trim_changed)
 
         # Keyboard zoom for mice without a wheel.
         self.zoom_shortcuts = []
@@ -1418,6 +1695,7 @@ class MainWindow(QMainWindow):
         self.spreads_combo.currentIndexChanged.connect(
             self.on_spreads_changed
         )
+        self.trim_check.toggled.connect(self.on_trim_toggled)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(False)
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1674,6 +1952,9 @@ class MainWindow(QMainWindow):
             self.force_check.setChecked(
                 self._as_bool(store.value("force_ocr", False))
             )
+            self.trim_check.setChecked(
+                self._as_bool(store.value("trim", False))
+            )
             self.terminal_check.setChecked(
                 self._as_bool(store.value("show_terminal", True))
             )
@@ -1708,6 +1989,7 @@ class MainWindow(QMainWindow):
         )
         store.setValue("output_dir", self.outdir_edit.text().strip())
         store.setValue("force_ocr", self.force_check.isChecked())
+        store.setValue("trim", self.trim_check.isChecked())
         store.setValue("show_terminal", self.terminal_check.isChecked())
         store.setValue("spreads", self.spreads_combo.currentData() or "off")
         store.setValue("engine", engine)
@@ -1728,6 +2010,7 @@ class MainWindow(QMainWindow):
             output_dir=self.outdir_edit.text().strip(),
             force_ocr=self.force_check.isChecked(),
             spreads=self.spreads_combo.currentData() or "off",
+            trim_enabled=self.trim_check.isChecked(),
             engine=self.engine_combo.currentData() or core.DEFAULT_ENGINE,
             tesseract_lang=(
                 self.tesseract_lang_combo.currentText().strip()
@@ -1795,6 +2078,11 @@ class MainWindow(QMainWindow):
             job = FileJob(path=path, pages=pages)
             job.page_pngs = [None] * pages
             job.page_texts = [""] * pages
+            job.page_keys = [None] * pages
+            sizes = self._page_sizes(path)
+            job.page_sizes = (
+                sizes if len(sizes) == pages else [(0.0, 0.0)] * pages
+            )
             # Nothing is checked by default: OCR only what the user selects.
             job.selected_pages = set()
             self.jobs.append(job)
@@ -1813,6 +2101,20 @@ class MainWindow(QMainWindow):
                 return document.page_count
         except Exception:
             return 0
+
+    @staticmethod
+    def _page_sizes(path: Path) -> list[tuple[float, float]]:
+        """Display-space page sizes in points (used by the Trim preview)."""
+        try:
+            with pymupdf.open(path) as document:
+                if document.needs_pass:
+                    return []
+                return [
+                    (page.rect.width, page.rect.height)
+                    for page in document
+                ]
+        except Exception:
+            return []
 
     def _file_item(self, job: FileJob, index: int) -> QListWidgetItem:
         item = QListWidgetItem(
@@ -1895,13 +2197,7 @@ class MainWindow(QMainWindow):
         self.pages_list.blockSignals(True)
         self.pages_list.clear()
         for number in range(1, job.pages + 1):
-            done = (
-                number - 1 < len(job.page_texts)
-                and bool(job.page_texts[number - 1])
-            )
-            item = QListWidgetItem(
-                f"Page {number}" + ("  ✓" if done else "")
-            )
+            item = QListWidgetItem(f"Page {number}")
             item.setData(Qt.ItemDataRole.UserRole, number)
             item.setFlags(
                 item.flags() | Qt.ItemFlag.ItemIsUserCheckable
@@ -1912,22 +2208,58 @@ class MainWindow(QMainWindow):
                 else Qt.CheckState.Unchecked
             )
             item.setToolTip(
-                "Checked: OCR this page and include it in the output. "
-                "✓ means it is already recognized."
+                "Checked: OCR this page and include it in the output.\n"
+                "✓ = recognized with the current settings (reused, no "
+                "re-OCR).\n"
+                "↻ = recognized earlier, but settings/split/trim changed; "
+                "Start OCR will redo it."
             )
             self.pages_list.addItem(item)
         self.pages_list.blockSignals(False)
+        self._refresh_page_marks()
         self._update_pages_label()
+
+    def _page_mark(self, job: FileJob, page_number: int, settings) -> str:
+        index = page_number - 1
+        if index >= len(job.page_keys) or job.page_keys[index] is None:
+            return ""
+        if job.page_keys[index] == page_cache_key(
+            settings, job, page_number
+        ):
+            return "  ✓"
+        return "  ↻"
+
+    def _refresh_page_marks(self) -> None:
+        if self.current_file is None:
+            return
+        job = self.jobs[self.current_file]
+        settings = self._current_settings()
+        self.pages_list.blockSignals(True)
+        try:
+            for number in range(1, job.pages + 1):
+                item = self.pages_list.item(number - 1)
+                if item is not None:
+                    item.setText(
+                        f"Page {number}"
+                        f"{self._page_mark(job, number, settings)}"
+                    )
+        finally:
+            self.pages_list.blockSignals(False)
+
+    def _schedule_marks_refresh(self, *_args) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
+        self.marks_timer.start()
 
     def _update_pages_label(self) -> None:
         if self.current_file is None:
-            self.pages_label.setText("Pages")
+            self.pages_label.setText("0/0")
             return
         job = self.jobs[self.current_file]
         checked = len(
             [p for p in job.selected_pages if 1 <= p <= job.pages]
         )
-        self.pages_label.setText(f"Pages — {checked}/{job.pages} checked")
+        self.pages_label.setText(f"{checked}/{job.pages}")
 
     def on_page_check_changed(self, item: QListWidgetItem) -> None:
         if self.current_file is None:
@@ -1947,18 +2279,51 @@ class MainWindow(QMainWindow):
         if self.current_file is None:
             return
         job = self.jobs[self.current_file]
+        if mode == "reset":
+            self._reset_checked_pages(job)
+            return
         all_pages = set(range(1, job.pages + 1))
         if mode == "all":
             job.selected_pages = all_pages
         elif mode == "none":
             job.selected_pages = set()
-        elif mode == "invert":
-            job.selected_pages = all_pages - job.selected_pages
         self._populate_pages(job)
         if job.pages:
             row = min(max(self.current_page, 1), job.pages) - 1
             self.pages_list.setCurrentRow(row)
         self.doc_browser.setMarkdown(self._document_markdown(job))
+
+    def _reset_checked_pages(self, job: FileJob) -> None:
+        """Drop cached text for the checked pages; selection stays as is."""
+        if self.running:
+            self._log("Stop the current run before resetting pages.")
+            return
+        pages = sorted(p for p in job.selected_pages if 1 <= p <= job.pages)
+        if not pages:
+            # No selection means "reset the whole file" rather than silently
+            # doing nothing (the marker would otherwise look stuck).
+            pages = list(range(1, job.pages + 1))
+            self._log(
+                f"No pages checked; resetting all {len(pages)} page(s) "
+                f"of {job.path.name}."
+            )
+        for page in pages:
+            if page - 1 < len(job.page_texts):
+                job.page_texts[page - 1] = ""
+            if page - 1 < len(job.page_keys):
+                job.page_keys[page - 1] = None
+            self.stream_buf.pop((self.current_file, page), None)
+        self._populate_pages(job)
+        if job.pages:
+            row = min(max(self.current_page, 1), job.pages) - 1
+            self.pages_list.setCurrentRow(row)
+            if self.current_page in pages:
+                self.show_page()
+        self.doc_browser.setMarkdown(self._document_markdown(job))
+        self._log(
+            f"Reset {len(pages)} page(s) in {job.path.name}; "
+            f"the next Start OCR re-recognizes them."
+        )
 
     def select_page(self, row: int) -> None:
         if self.current_file is None:
@@ -1978,6 +2343,29 @@ class MainWindow(QMainWindow):
             self.pages_list.setCurrentRow(target - 1)
 
     # -------------------------------------------------------------- regions
+    def _invalidate_page(self, job: FileJob, page_number: int) -> None:
+        """Drop a page's cached text because its OCR inputs changed."""
+        index = page_number - 1
+        if not (0 <= index < len(job.page_texts)):
+            return
+        had_text = bool(job.page_texts[index])
+        job.page_texts[index] = ""
+        if index < len(job.page_keys):
+            job.page_keys[index] = None
+        self.stream_buf.pop((self.current_file, page_number), None)
+        if self.current_file is None or job is not self.jobs[self.current_file]:
+            return
+        item = self.pages_list.item(index)
+        if item is not None:
+            self.pages_list.blockSignals(True)
+            item.setText(f"Page {page_number}")
+            self.pages_list.blockSignals(False)
+        if had_text:
+            self.doc_browser.setMarkdown(self._document_markdown(job))
+            if self.current_page == page_number:
+                self.raw_edit.clear()
+                self.page_browser.setPlainText("(not recognized yet)")
+
     def on_regions_changed(self) -> None:
         if self.current_file is None:
             return
@@ -1987,12 +2375,15 @@ class MainWindow(QMainWindow):
             job.regions[self.current_page] = regions
         else:
             job.regions.pop(self.current_page, None)
+        self._invalidate_page(job, self.current_page)
         self._update_regions_hint()
 
     def clear_page_regions(self) -> None:
         if self.current_file is None:
             return
-        self.jobs[self.current_file].regions.pop(self.current_page, None)
+        job = self.jobs[self.current_file]
+        job.regions.pop(self.current_page, None)
+        self._invalidate_page(job, self.current_page)
         self.image_view.set_regions([])
         self._update_regions_hint()
 
@@ -2004,20 +2395,37 @@ class MainWindow(QMainWindow):
         self.btn_clear_regions.setEnabled(count > 0 and not self.running)
 
     def on_spreads_changed(self, *_args) -> None:
-        mode = self.spreads_combo.currentData() or "off"
-        fraction = 0.5
-        if self.current_file is not None:
-            fraction = self.jobs[self.current_file].splits.get(
-                self.current_page, 0.5
-            )
-        self.image_view.set_spread(
-            mode != "off", fraction, auto=(mode == "auto")
+        if self.current_file is None:
+            mode = self.spreads_combo.currentData() or "off"
+            self.image_view.set_spread(mode != "off", auto=(mode == "auto"))
+            return
+        self._sync_spreads(
+            self.jobs[self.current_file], self.current_page
         )
 
     def on_split_changed(self, fraction: float) -> None:
         if self.current_file is None:
             return
-        self.jobs[self.current_file].splits[self.current_page] = fraction
+        job = self.jobs[self.current_file]
+        page = self.current_page
+        job.splits[page] = fraction
+        # Dragging the marker always (re)enables the split for this page.
+        job.no_split.discard(page)
+        self._invalidate_page(job, page)
+        self._sync_spreads(job, page)
+
+    def on_split_disabled(self) -> None:
+        if self.current_file is None:
+            return
+        job = self.jobs[self.current_file]
+        page = self.current_page
+        job.no_split.add(page)
+        self._invalidate_page(job, page)
+        self._sync_spreads(job, page)
+        self._log(
+            f"{job.path.name}: page {page} split disabled "
+            f"(drag the dashed line to re-enable)"
+        )
 
     def _sync_spreads(self, job: FileJob, page_number: int) -> None:
         mode = self.spreads_combo.currentData() or "off"
@@ -2025,7 +2433,43 @@ class MainWindow(QMainWindow):
             mode != "off",
             job.splits.get(page_number, 0.5),
             auto=(mode == "auto"),
+            disabled=page_number in job.no_split,
         )
+
+    def on_trim_changed(self, trim_cm) -> None:
+        if self.current_file is None:
+            return
+        job = self.jobs[self.current_file]
+        job.trim_cm = tuple(float(v) for v in trim_cm)
+        self._schedule_marks_refresh()
+        self._log(
+            f"Trim {job.path.name}: "
+            f"{job.trim_cm[0]:.2f}/{job.trim_cm[1]:.2f}/"
+            f"{job.trim_cm[2]:.2f}/{job.trim_cm[3]:.2f} cm "
+            f"(top/right/bottom/left)"
+        )
+
+    def on_trim_toggled(self, checked: bool) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
+        self._save_settings()
+        if self.current_file is not None:
+            self._sync_trim(self.jobs[self.current_file])
+
+    def _sync_trim(self, job: FileJob) -> None:
+        page = self.current_page
+        size = None
+        if 0 <= page - 1 < len(job.page_sizes):
+            size = job.page_sizes[page - 1]
+        self.image_view.set_trim(
+            self.trim_check.isChecked(), job.trim_cm, size
+        )
+
+    def _page_trim(self, job: FileJob, page):
+        """Trim rect for one page, or None when Trim is off."""
+        if not self.trim_check.isChecked():
+            return None
+        return core.trim_rect(page, job.trim_cm)
 
     # ---------------------------------------------------------------- zoom
     PREVIEW_MAX_ZOOM = 8.0
@@ -2127,7 +2571,9 @@ class MainWindow(QMainWindow):
                     if index < len(job.page_pngs):
                         job.page_pngs[index] = cached
                 if is_pdf and not processed:
-                    text_layer = core.extract_text_layer(page)
+                    text_layer = core.extract_text_layer(
+                        page, self._page_trim(job, page)
+                    )
         except Exception as exc:
             self._log(f"Preview failed for page {page_number}: {exc}")
         return cached, text_layer
@@ -2152,6 +2598,7 @@ class MainWindow(QMainWindow):
         self._show_image_bytes(data, page_number)
         self.image_view.set_regions(job.regions.get(page_number, []))
         self._sync_spreads(job, page_number)
+        self._sync_trim(job)
         self._update_regions_hint()
         self._reset_preview_zoom()
 
@@ -2175,6 +2622,7 @@ class MainWindow(QMainWindow):
         self._show_image_bytes(png, page_number)
         self.image_view.set_regions(job.regions.get(page_number, []))
         self._sync_spreads(job, page_number)
+        self._sync_trim(job)
         self._update_regions_hint()
         self._reset_preview_zoom()
 
@@ -2225,7 +2673,7 @@ class MainWindow(QMainWindow):
         self._update_regions_hint()
         self._reset_preview_zoom()
         self.doc_label.setText("No document")
-        self.pages_label.setText("Pages")
+        self.pages_label.setText("0/0")
         self.raw_edit.clear()
         self.page_browser.clear()
         self.doc_browser.clear()
@@ -2273,7 +2721,7 @@ class MainWindow(QMainWindow):
         self.pages_list.setEnabled(not running)
         self.btn_pages_all.setEnabled(not running)
         self.btn_pages_none.setEnabled(not running)
-        self.btn_pages_invert.setEnabled(not running)
+        self.btn_pages_reset.setEnabled(not running)
         self.running = running
         self.engine_combo.setEnabled(not running)
         self.on_engine_changed()
@@ -2309,28 +2757,66 @@ class MainWindow(QMainWindow):
         self.server_edit.setText(settings.server)
 
         self._save_settings()
+        cached_total = 0
         for job in self.jobs:
-            job.status = "Pending"
-            job.error = ""
-            job.output_path = ""
             if len(job.page_pngs) != job.pages:
                 job.page_pngs = [None] * job.pages
             if len(job.page_texts) != job.pages:
                 job.page_texts = [""] * job.pages
-            for page in job.selected_pages:
-                if 1 <= page <= job.pages:
-                    job.page_texts[page - 1] = ""
+            if len(job.page_keys) != job.pages:
+                job.page_keys = [None] * job.pages
+            job.pages_to_ocr = set()
+            job.run_keys = {}
+            selected = sorted(
+                p for p in job.selected_pages if 1 <= p <= job.pages
+            )
+            if not selected:
+                continue
+            job.status = "Pending"
+            job.error = ""
+            job.output_path = ""
+            for page in selected:
+                key = page_cache_key(settings, job, page)
+                if job.page_keys[page - 1] == key:
+                    cached_total += 1
+                    continue
+                job.pages_to_ocr.add(page)
+                job.run_keys[page] = key
+                job.page_texts[page - 1] = ""
+        to_process = sum(
+            len(job.pages_to_ocr) for job in self.jobs
+        )
+        if to_process == 0:
+            QMessageBox.information(
+                self,
+                "Already recognized",
+                f"All {cached_total} checked page(s) are already "
+                f"recognized.\nUse Reset to re-OCR the checked pages.",
+            )
+            return
+        if self.current_file is not None:
+            job = self.jobs[self.current_file]
+            self._populate_pages(job)
+            if job.pages:
+                row = min(max(self.current_page, 1), job.pages) - 1
+                self.pages_list.setCurrentRow(row)
+                if self.current_page in job.pages_to_ocr:
+                    self.show_page()
         self.rebuild_files_list()
         self.stream_buf.clear()
         self.active_pages.clear()
         self.pages_done = 0
-        self.total_pages = selected_total
+        self.total_pages = to_process
         self.progress.setRange(0, max(self.total_pages, 1))
         self.progress.setValue(0)
         self.log_edit.clear()
         self.cancelled = False
         self.server_error = False
-        self._log(f"Starting OCR ({selected_total} page(s))...")
+        self._log(f"Starting OCR ({to_process} page(s))...")
+        if cached_total:
+            self._log(
+                f"Reusing cached text for {cached_total} checked page(s)."
+            )
         self._log_run_settings(settings)
         self._set_running(True)
         self.render_timer.start()
@@ -2359,16 +2845,22 @@ class MainWindow(QMainWindow):
             if settings.max_side <= 0
             else f"{settings.max_side} px"
         )
+        extras = []
+        if settings.spreads != "off":
+            extras.append(f"split {settings.spreads}")
+        if settings.trim_enabled:
+            extras.append("trim on")
+        tail = (", " + ", ".join(extras)) if extras else ""
         if settings.engine == "tesseract":
             self._log(
                 f"Settings: engine tesseract, lang "
                 f"{settings.tesseract_lang!r}, dpi {settings.dpi} (PDFs), "
-                f"max side {cap}"
+                f"max side {cap}{tail}"
             )
             return
         self._log(
             f"Settings: dpi {settings.dpi} (PDFs only), max side {cap}, "
-            f"prompt {settings.prompt!r}"
+            f"prompt {settings.prompt!r}{tail}"
         )
         raster = core.IMAGE_SUFFIXES | core.COMIC_SUFFIXES
         if settings.max_side <= 0 and any(
@@ -2551,6 +3043,8 @@ class MainWindow(QMainWindow):
             job.page_pngs = [None] * total
         if len(job.page_texts) != total:
             job.page_texts = [""] * total
+        if len(job.page_keys) != total:
+            job.page_keys = [None] * total
         if self.current_file == index:
             self._populate_pages(job)
         self.update_file_item(index)
@@ -2608,7 +3102,10 @@ class MainWindow(QMainWindow):
         if self.current_file == index:
             item = self.pages_list.item(page - 1)
             if item is not None:
-                item.setText(f"Page {page}  ✓")
+                mark = self._page_mark(
+                    job, page, self._current_settings()
+                )
+                item.setText(f"Page {page}{mark}")
             if self.current_page == page:
                 self.raw_edit.setPlainText(text)
                 self.page_browser.setMarkdown(text)
@@ -2668,8 +3165,9 @@ class MainWindow(QMainWindow):
         try:
             with pymupdf.open(job.path) as document:
                 for number in pages:
+                    page = document.load_page(number - 1)
                     text = core.extract_text_layer(
-                        document.load_page(number - 1)
+                        page, self._page_trim(job, page)
                     ).strip()
                     if text:
                         parts.append(text)

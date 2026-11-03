@@ -25,12 +25,15 @@ page preview and review tabs. The UI may still change.*
   tables/layout.
 - **Images and CBZ comics** — image documents render at source resolution;
   CBZ archives are read through PyMuPDF's ZIP support.
-- **GUI** — lazy page previews, page checkboxes (unchecked by default), OCR
-  regions, Ctrl+wheel / Ctrl± zoom, Firefox-style middle-click autoscroll,
-  two-page spreads (Auto/LTR/RTL), one-shot Ask tab, Markdown/TXT/ODT export,
-  and Save as without re-OCRing.
-- **CLI** — page ranges, engine selection, spreads, output to md/txt/odt/docx/
-  html, and streaming.
+- **GUI** — lazy page previews, page checkboxes (unchecked by default), a
+  per-page recognition cache (Start OCR reuses results and only redoes pages
+  whose settings changed), OCR regions, **Split** (Auto wide-page spreads,
+  Books L2R, Manga R2L — explicit modes also split portrait two-column
+  pages), **Trim** margins to drop running heads/page numbers, Ctrl+wheel /
+  Ctrl± zoom, Firefox-style middle-click autoscroll, one-shot Ask tab,
+  Markdown/TXT/ODT export, and Save as without re-OCRing.
+- **CLI** — page ranges, engine selection, split, trim, output to
+  md/txt/odt/docx/html, and streaming.
 - **Portable setup** — optional `tesseract/` folder, `tessdata/`, and a
   `refinedocr.ini` settings file next to the source or exe.
 
@@ -110,7 +113,8 @@ python src\refinedocr.py scan.pdf -o scan.md
 python src\refinedocr.py page.png --engine tesseract -o page.txt
 python src\refinedocr.py book.pdf --pages 1-10 --force-ocr -o out.md
 python src\refinedocr.py comic.cbz --format txt -o comic.txt
-python src\refinedocr.py book.pdf --spreads auto --max-side 1200 -o book.md
+python src\refinedocr.py book.pdf --split auto --max-side 1200 -o book.md
+python src\refinedocr.py scan.pdf --split ltr --trim 1,0,1,0 -o scan.md
 ```
 
 Server engine (requires `llama-server`):
@@ -203,16 +207,22 @@ the INI.
 
 1. Open files (or drag them in). Pages start **unchecked**; check the pages you
    want to OCR.
-2. Choose the engine, language, DPI and Max side.
-3. Start OCR; previews and recognized text stream in.
-4. Use **Save as…** to export without OCR-ing again.
+2. Choose the engine, language, DPI, Max side, Split and Trim settings.
+3. Start OCR; previews and recognized text stream in. Recognized pages show
+   `✓`; after a settings change they show `↻` and will be redone, while
+   unchanged pages are reused from the cache.
+4. Use **Reset** to forget recognized text (checked pages, or all pages when
+   nothing is checked), and **Save as…** to export without OCR-ing again.
 5. For server Q&A, select **Engine = OCR model (server)**, open the **Ask** tab,
    type a question, and press **Send prompt** or Enter. The Prompt is shared
    with OCR, so set it back to `OCR markdown` before running OCR again.
 
 Preview: Ctrl+drag adds up to 5 OCR regions per page; `Ctrl+wheel` or
-`Ctrl++`/`Ctrl+-` zooms; middle-click starts autoscroll; the Spreads combo can
-split landscape scans automatically or in LTR/RTL order.
+`Ctrl++`/`Ctrl+-` zooms; middle-click starts autoscroll. **Split** has Auto
+(wide two-page scans, L2R), Books (every page, L2R) and Manga (every page,
+R2L); right-click the dashed line to disable it on the current page. **Trim**
+draws four draggable teal lines (default 1 cm top/bottom); values are per file
+and apply to every page, and double-clicking a line restores the defaults.
 
 ## Acknowledgements
 

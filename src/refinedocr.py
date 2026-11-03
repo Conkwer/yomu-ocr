@@ -56,6 +56,9 @@ DEFAULT_TIMEOUT = 180
 DEFAULT_ENGINE = "tesseract"
 DEFAULT_ENGINE_LABEL = "OCR model (server)"
 DEFAULT_TESSERACT_LANG = "rus+eng"
+# Trim margins in cm: top, right, bottom, left. Footers/headers are the
+# common problem, so only top/bottom are trimmed by default.
+DEFAULT_TRIM_CM = (1.0, 0.0, 1.0, 0.0)
 SETTINGS_FILENAME = "refinedocr.ini"
 # A page this much wider than tall is treated as a two-page scan in the
 # "auto" spreads mode. Dendy guide spreads measure ~1.15-1.25.
@@ -109,10 +112,55 @@ def log(message: str) -> None:
     print(message, file=stream, flush=True)
 
 
-def extract_text_layer(page) -> str:
-    """Read a PDF page's text layer, preserving block/paragraph boundaries."""
-    blocks = page.get_text("blocks")
+def extract_text_layer(page, clip=None) -> str:
+    """Read a PDF page's text layer, preserving block/paragraph boundaries.
+
+    ``clip`` is a display-space (rotated) rectangle used by Trim; PyMuPDF
+    expects text clip rectangles in unrotated page coordinates, so the rect
+    is mapped through ``page.derotation_matrix``.
+    """
+    text_clip = None
+    if clip is not None:
+        text_clip = pymupdf.Rect(clip) * page.derotation_matrix
+    blocks = page.get_text("blocks", clip=text_clip)
     return "\n\n".join(block[4].strip() for block in blocks if block[4].strip())
+
+
+CM_TO_PT = 72.0 / 2.54
+
+
+def trim_rect(page, trim_cm):
+    """Display-space crop rect for (top, right, bottom, left) in cm.
+
+    Returns ``None`` when trimming is disabled or would leave no useful area.
+    """
+    if not trim_cm:
+        return None
+    top, right, bottom, left = (max(0.0, float(v)) for v in trim_cm)
+    if not any((top, right, bottom, left)):
+        return None
+    rect = page.rect
+    result = pymupdf.Rect(
+        rect.x0 + left * CM_TO_PT,
+        rect.y0 + top * CM_TO_PT,
+        rect.x1 - right * CM_TO_PT,
+        rect.y1 - bottom * CM_TO_PT,
+    )
+    if result.is_empty or result.width < 8 or result.height < 8:
+        return None
+    return result
+
+
+def trim_clips(clips, trim):
+    """Intersect clip rects with a trim rect, dropping emptied clips."""
+    if trim is None:
+        return clips
+    result = []
+    for clip in clips:
+        part = pymupdf.Rect(clip).intersect(trim)
+        if not part.is_empty and part.width > 0 and part.height > 0:
+            result.append(part)
+    return result
 
 
 def parse_pages(spec: str | None, total: int) -> list[int]:
@@ -197,21 +245,26 @@ def png_size(data: bytes) -> tuple[int, int]:
     return 0, 0
 
 
-def spread_clips(page, mode: str, fraction: float = 0.5) -> list:
-    """Left/right clip rects for a landscape two-page spread, in reading order.
+def spread_clips(page, mode: str, fraction: float = 0.5, enabled=None) -> list:
+    """Left/right clip rects for a two-column page, in reading order.
 
     ``mode`` is "ltr" (left page first, western books), "rtl" (right page
     first, manga), or "auto" (split only clearly landscape pages, LTR);
-    ``fraction`` is the split position from the left edge. Returns [] for
-    portrait pages, for "off", and for "auto" pages that are not wide enough
-    to be a two-page scan.
+    ``fraction`` is the split position from the left edge.
+
+    Auto never touches portrait pages. Explicit ltr/rtl split any page,
+    including portrait two-column pages; the GUI passes ``enabled=False``
+    to skip pages where the user disabled the split. Returns [] for "off".
     """
     if mode not in ("auto", "ltr", "rtl"):
         return []
     rect = page.rect
-    if rect.width <= rect.height:
-        return []
-    if mode == "auto" and rect.width / rect.height < AUTO_SPREAD_MIN_ASPECT:
+    if mode == "auto":
+        if rect.width <= rect.height:
+            return []
+        if rect.width / rect.height < AUTO_SPREAD_MIN_ASPECT:
+            return []
+    elif enabled is False:
         return []
     fraction = min(max(fraction, 0.1), 0.9)
     middle = rect.x0 + rect.width * fraction
@@ -717,6 +770,12 @@ def process_file(source: Path, out_path: Path, fmt: str, args) -> None:
         is_pdf = suffix in PDF_SUFFIXES
         pages = parse_pages(args.pages, total)
         spread_mode = getattr(args, "spreads", "off")
+        trim = getattr(args, "trim", None)
+        if trim:
+            log(
+                f"Trim: {trim[0]:g}/{trim[1]:g}/{trim[2]:g}/{trim[3]:g} cm "
+                f"(top/right/bottom/left)"
+            )
         texts: list[str] = []
         ocr_pages = 0
 
@@ -729,18 +788,26 @@ def process_file(source: Path, out_path: Path, fmt: str, args) -> None:
                 log(f"{prefix}: unreadable page, skipped")
                 continue
 
+            page_trim = trim_rect(page, trim) if trim else None
+            if trim and page_trim is None:
+                log(f"{prefix}: trim covers the whole page; ignored")
             clips = spread_clips(
                 page, spread_mode, getattr(args, "split_at", 0.5)
             )
+            if clips and page_trim is not None:
+                clips = trim_clips(clips, page_trim)
             if clips:
-                log(f"{prefix}: spread {spread_mode.upper()} (2 halves)")
+                halves = "2 halves" if len(clips) == 2 else "1 half"
+                log(f"{prefix}: split {spread_mode.upper()} ({halves})")
             else:
-                text = extract_text_layer(page) if is_pdf else ""
+                text = (
+                    extract_text_layer(page, page_trim) if is_pdf else ""
+                )
                 if text and not args.force_ocr:
                     texts.append(text)
                     log(f"{prefix}: text layer ({len(text)} chars)")
                     continue
-                clips = [None]
+                clips = [page_trim]
 
             results: list[str] = []
             prompt_total = 0
@@ -781,10 +848,7 @@ def process_file(source: Path, out_path: Path, fmt: str, args) -> None:
                 if not result:
                     if len(clips) > 1:
                         log(f"{prefix}: half {clip_index} returned no text")
-                        continue
-                    raise SystemExit(
-                        f"{source}: model returned no text for page {page_number}"
-                    )
+                    continue
                 results.append(result)
                 prompt_total += usage.get("prompt_tokens") or 0
                 completion_total += usage.get("completion_tokens") or 0
@@ -795,9 +859,11 @@ def process_file(source: Path, out_path: Path, fmt: str, args) -> None:
                     )
             page_text = "\n\n".join(results)
             if not page_text:
-                raise SystemExit(
-                    f"{source}: nothing recognized for page {page_number}"
-                )
+                # Blank/cover pages are normal; skip them instead of
+                # failing the whole file. A fully empty selection is still
+                # reported below.
+                log(f"{prefix}: no text found, page skipped")
+                continue
             texts.append(page_text)
             ocr_pages += 1
             log(
@@ -808,7 +874,9 @@ def process_file(source: Path, out_path: Path, fmt: str, args) -> None:
 
         markdown = "\n\n".join(part for part in texts if part.strip())
         if not markdown:
-            raise SystemExit(f"{source}: nothing recognized")
+            raise SystemExit(
+                f"{source}: nothing recognized on the selected pages"
+            )
 
     if str(out_path) == "-":
         if fmt not in ("md", "txt"):
@@ -882,14 +950,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="OCR every PDF page even when a text layer exists",
     )
     parser.add_argument(
-        "--spreads", choices=("off", "auto", "ltr", "rtl"), default="off",
-        help="split landscape two-page scans into halves: auto = split pages "
-             f"at least {AUTO_SPREAD_MIN_ASPECT:g}x wider than tall (LTR), "
-             "ltr = books, rtl = manga; default: off",
+        "--split", dest="spreads", choices=("off", "auto", "ltr", "rtl"),
+        default="off",
+        help="split pages into left/right halves: auto = only pages at least "
+             f"{AUTO_SPREAD_MIN_ASPECT:g}x wider than tall (LTR), "
+             "ltr = books (all pages), rtl = manga (all pages); default: off",
     )
     parser.add_argument(
         "--split-at", type=float, default=0.5, metavar="FRACTION",
-        help="split position from the left edge for --spreads (default: 0.5)",
+        help="split position from the left edge for --split (default: 0.5)",
+    )
+    parser.add_argument(
+        "--trim", nargs="?", const="1,0,1,0", metavar="CM",
+        help="trim margins in cm before OCR/text-layer extraction: '1' for "
+             "all sides or 'top,right,bottom,left'; no value = 1,0,1,0 "
+             "(1 cm top and bottom)",
     )
     parser.add_argument(
         "--engine", choices=("glm", "tesseract"), default=DEFAULT_ENGINE,
@@ -915,6 +990,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.trim is not None:
+        try:
+            values = [
+                float(part)
+                for part in str(args.trim).replace(" ", "").split(",")
+                if part != ""
+            ]
+        except ValueError:
+            parser.error("--trim expects numbers in cm, e.g. 1 or 1,0,1,0")
+        if len(values) == 1:
+            values *= 4
+        if len(values) != 4 or any(value < 0 for value in values):
+            parser.error(
+                "--trim expects one value or top,right,bottom,left "
+                "(all non-negative)"
+            )
+        args.trim = tuple(values)
     fmt = infer_format(args.output, args.format)
     if args.max_side is None:
         args.max_side = (
